@@ -1,0 +1,9 @@
+target-version = "py311"
+line-length = 110
+
+[lint]
+select = ["E", "F"]
+ignore = ["E402", "E501"]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["S101"]

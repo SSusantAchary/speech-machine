@@ -1,0 +1,18 @@
+{
+  "name": "video-coach",
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "packages/shared"
+  ],
+  "scripts": {
+    "dev": "docker compose up",
+    "lint": "npm --workspace apps/web run lint",
+    "format": "npm --workspace apps/web run format",
+    "test": "npm --workspace apps/web run test",
+    "desktop:build:web": "npm --workspace apps/web run build && node infra/scripts/prepare_desktop_web.mjs",
+    "desktop:start:web": "node infra/scripts/desktop_web.mjs",
+    "desktop:start:api": "python3 infra/scripts/desktop_api.py",
+    "desktop:start": "node infra/scripts/desktop_runtime.mjs"
+  }
+}

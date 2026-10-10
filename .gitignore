@@ -1,0 +1,42 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+# Dependencies
+node_modules/
+apps/api/.venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+test_*.db
+local.db
+
+# Frontend
+.next/
+apps/web/public/pdf.worker.min.mjs
+out/
+dist/
+*.tsbuildinfo
+coverage/
+playwright-report/
+test-results/
+
+# Runtime data
+uploads/
+storage/
+models/
+*.zip
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
