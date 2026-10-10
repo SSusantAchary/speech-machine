@@ -181,6 +181,56 @@ Practical guidance:
 - Pytest
 - Make
 
+## Architecture
+
+```mermaid
+flowchart LR
+    User([Speaker]) --> Browser
+
+    subgraph Client[Browser / Next.js]
+        Browser[Next.js web app]
+        Capture[MediaRecorder<br/>camera and microphone]
+        Live[MediaPipe + Web Audio<br/>live delivery metrics]
+        Drafts[(IndexedDB<br/>draft recovery)]
+        Browser --> Capture
+        Browser --> Live
+        Browser <--> Drafts
+    end
+
+    Browser <-->|HTTPS / JSON<br/>job polling| API
+
+    subgraph Services[Docker application services]
+        API[FastAPI API<br/>authentication and sessions]
+        Queue[(Redis<br/>arq job queue)]
+        Worker[Background worker]
+        Database[(PostgreSQL<br/>sessions and analytics)]
+        Storage[(Local or S3 storage<br/>video and documents)]
+
+        API <--> Database
+        API <--> Storage
+        API -->|enqueue transcription| Queue
+        Queue --> Worker
+        Worker <--> Storage
+        Worker --> Database
+    end
+
+    subgraph Intelligence[Local intelligence]
+        Media[ffmpeg]
+        ASR[faster-whisper<br/>or optional MLX Audio]
+        Coach[Ollama, LM Studio,<br/>or llama.cpp]
+        Media --> ASR
+    end
+
+    Worker --> Media
+    ASR -->|transcript and metrics| Worker
+    Worker -->|session context| Coach
+    Coach -->|structured coaching| Worker
+```
+
+Recordings and uploaded videos are validated by the API, stored locally or in S3-compatible storage, and queued through Redis. The worker extracts audio, runs transcription, computes analytics, and optionally requests structured coaching from a local LLM. The web app polls for job completion and renders the saved session, dashboard trends, and coaching feedback.
+
+See [the architecture guide](./docs/ARCHITECTURE.md) for the request lifecycle and security boundaries.
+
 ## Repository Layout
 
 - `apps/web`: Next.js frontend
