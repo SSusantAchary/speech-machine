@@ -169,6 +169,7 @@ export default function RecordPage() {
         setError("Camera or microphone unavailable. Check permissions and retry.");
       }
     },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [cameraOn, micOn, recorder.startStream, recorder.stopStream, routeReady, safeMode, status]
   );
 
@@ -207,6 +208,7 @@ export default function RecordPage() {
       .catch(() => {
         setError("Camera or microphone blocked. Click Camera/Mic to retry.");
       });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [cameraOn, micOn, recorder.startStream, routeReady, safeMode]);
 
   useEffect(() => {

@@ -17,7 +17,13 @@ COPY packages/shared ./packages/shared
 
 WORKDIR /app/apps/web
 RUN npm run build
+RUN mkdir -p .next/standalone/apps/web/.next \
+    && cp -R .next/static .next/standalone/apps/web/.next/static \
+    && cp -R public .next/standalone/apps/web/public
 
 EXPOSE 3000
 
-CMD ["npm", "run", "start"]
+ENV HOSTNAME=0.0.0.0
+ENV PORT=3000
+
+CMD ["node", ".next/standalone/apps/web/server.js"]

@@ -1,21 +1,46 @@
 import json
 import os
 import zipfile
+import asyncio
 from io import BytesIO
 from uuid import uuid4
 
-os.environ["DATABASE_URL"] = f"sqlite:///./test_{uuid4().hex}.db"
+test_id = uuid4().hex
+os.environ["DATABASE_URL"] = f"sqlite:///./test_{test_id}.db"
 os.environ["LOCAL_ONLY_MODE"] = "true"
+os.environ["STORAGE_DIR"] = f"/private/tmp/speech_machine_test_{test_id}"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, inspect
 
 from app import models, schema_upgrades
-from app.db import SessionLocal
+from app.db import Base, SessionLocal, engine
 from app.main import app
 from app.routes import settings as settings_routes
+from app.routes import coaching as coaching_routes
+from app.services.coaching import build_coaching_prompt, parse_coaching_response
+from app.worker import jobs as worker_jobs
 
 client = TestClient(app)
+Base.metadata.create_all(bind=engine)
+_admin_headers: dict[str, str] | None = None
+
+
+def get_admin_headers() -> dict[str, str]:
+    global _admin_headers
+    if _admin_headers is not None:
+        return _admin_headers
+    status_response = client.get("/setup/status")
+    if status_response.json()["setup_required"]:
+        setup_response = client.post(
+            "/setup",
+            json={"email": "admin@example.com", "password": "secret123"},
+        )
+        assert setup_response.status_code == 201
+    response = client.post("/auth/login", json={"email": "admin@example.com", "password": "secret123"})
+    assert response.status_code == 200
+    _admin_headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    return _admin_headers
 
 
 def create_transcription_model(model_id: str, name: str, available: bool = True, local_path: str | None = None):
@@ -31,6 +56,11 @@ def create_transcription_model(model_id: str, name: str, available: bool = True,
 
 
 def test_auth_flow():
+    response = client.get("/setup/status")
+    if response.json()["setup_required"]:
+        response = client.post("/setup", json={"email": "admin@example.com", "password": "secret123"})
+        assert response.status_code == 201
+
     response = client.post("/auth/signup", json={"email": "test@example.com", "password": "secret123"})
     assert response.status_code == 200
     token = response.json()["access_token"]
@@ -38,6 +68,39 @@ def test_auth_flow():
 
     response = client.post("/auth/login", json={"email": "test@example.com", "password": "secret123"})
     assert response.status_code == 200
+
+
+def test_refresh_rotation_and_logout():
+    status_response = client.get("/setup/status")
+    if status_response.json()["setup_required"]:
+        client.post("/setup", json={"email": "admin@example.com", "password": "secret123"})
+
+    login_response = client.post(
+        "/auth/login",
+        json={"email": "admin@example.com", "password": "secret123"},
+    )
+    assert login_response.status_code == 200
+
+    first_refresh_cookie = login_response.cookies.get("refresh_token")
+    refresh_response = client.post("/auth/refresh", cookies={"refresh_token": first_refresh_cookie})
+    assert refresh_response.status_code == 200
+    assert refresh_response.cookies.get("refresh_token")
+    assert refresh_response.cookies.get("refresh_token") != first_refresh_cookie
+
+    reused_response = client.post("/auth/refresh", cookies={"refresh_token": first_refresh_cookie})
+    assert reused_response.status_code == 401
+
+    logout_response = client.post("/auth/logout", cookies={"refresh_token": refresh_response.cookies.get("refresh_token")})
+    assert logout_response.status_code == 200
+    after_logout = client.post("/auth/refresh", cookies={"refresh_token": refresh_response.cookies.get("refresh_token")})
+    assert after_logout.status_code == 401
+
+
+def test_health_endpoints():
+    assert client.get("/health").status_code == 200
+    response = client.get("/health/ready")
+    assert response.status_code == 200
+    assert "database" in response.json()["checks"]
 
 
 def test_transcription_settings_endpoint(monkeypatch):
@@ -89,9 +152,7 @@ def test_transcription_settings_endpoint(monkeypatch):
             }
         ],
     )
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     response = client.get("/settings/transcription", headers=headers)
     assert response.status_code == 200
@@ -129,9 +190,7 @@ def test_transcription_settings_endpoint_marks_unsupported_mlx_audio(monkeypatch
         ],
     )
     monkeypatch.setattr(settings_routes, "get_all_engine_statuses", lambda: [])
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     response = client.get("/settings/transcription", headers=headers)
     assert response.status_code == 200
@@ -151,9 +210,7 @@ def test_transcription_model_download_endpoint(monkeypatch):
             local_path="/tmp/models/parakeet",
         ),
     )
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     response = client.post(
         "/settings/transcription/models/download",
@@ -179,9 +236,7 @@ def test_local_inference_check_endpoint(monkeypatch):
             "available_models": ["mistralai/Voxtral-Mini-4B-Realtime-2602"],
         },
     )
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     response = client.post(
         "/settings/local-inference/check",
@@ -194,9 +249,7 @@ def test_local_inference_check_endpoint(monkeypatch):
 
 
 def test_session_create_and_upload():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Test",
@@ -213,7 +266,7 @@ def test_session_create_and_upload():
     assert response.status_code == 200
     session_id = response.json()["id"]
 
-    video_data = BytesIO(b"\x00\x01\x02")
+    video_data = BytesIO(b"\x1a\x45\xdf\xa3webm-data")
     files = {"file": ("test.webm", video_data, "video/webm")}
     response = client.post(f"/sessions/{session_id}/upload", files=files, headers=headers)
     assert response.status_code == 200
@@ -225,9 +278,7 @@ def test_session_create_and_upload():
 
 
 def test_export_includes_recording_file():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Export",
@@ -252,9 +303,7 @@ def test_export_includes_recording_file():
 
 
 def test_transcript_download_formats():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Transcript Download",
@@ -284,9 +333,7 @@ def test_transcript_download_formats():
 
 
 def test_delete_video_keeps_session_transcript():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Delete Video",
@@ -319,10 +366,29 @@ def test_delete_video_keeps_session_transcript():
     assert "Keep transcript" in txt_response.text
 
 
+def test_video_upload_rejects_invalid_magic_bytes():
+    headers = get_admin_headers()
+
+    payload = {
+        "title": "Invalid Upload",
+        "mode": "Upload",
+        "duration_ms": 1000,
+        "transcript_segments": [],
+        "metrics": [],
+    }
+    response = client.post("/sessions", json=payload, headers=headers)
+    session_id = response.json()["id"]
+
+    upload_response = client.post(
+        f"/sessions/{session_id}/upload",
+        files={"file": ("bad.webm", BytesIO(b"not-a-webm"), "video/webm")},
+        headers=headers,
+    )
+    assert upload_response.status_code == 415
+
+
 def test_session_document_upload_round_trip_and_full_delete():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Document Session",
@@ -367,9 +433,7 @@ def test_session_document_upload_round_trip_and_full_delete():
 
 
 def test_document_upload_rejects_unsupported_types():
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Unsupported Doc",
@@ -395,6 +459,276 @@ def test_document_upload_rejects_unsupported_types():
     )
     assert upload_response.status_code == 400
     assert "Unsupported document type" in upload_response.json()["detail"]
+
+
+def test_dashboard_endpoints_populate_metrics_and_aggregates():
+    headers = get_admin_headers()
+
+    first = client.post(
+        "/sessions",
+        json={
+            "title": "Analytics One",
+            "mode": "Practice",
+            "duration_ms": 60000,
+            "wpm_avg": 120,
+            "filler_count": 2,
+            "eye_contact_pct": 0.75,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 60000, "text": "Um hello world like today"}],
+            "metrics": [
+                {"t": 0, "wpm": 120, "rms": 50, "eye_contact": 0.75, "smile": 0.4, "yaw": 0.1, "pitch": 0.2, "roll": 0.1, "filler_count": 1, "pause_ms": 900}
+            ],
+        },
+        headers=headers,
+    )
+    assert first.status_code == 200
+    second = client.post(
+        "/sessions",
+        json={
+            "title": "Analytics Two",
+            "mode": "Practice",
+            "duration_ms": 60000,
+            "wpm_avg": 140,
+            "filler_count": 0,
+            "eye_contact_pct": 0.8,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 60000, "text": "First we improve outcomes"}],
+            "metrics": [
+                {"t": 0, "wpm": 140, "rms": 60, "eye_contact": 0.8, "smile": 0.5, "yaw": 0.1, "pitch": 0.1, "roll": 0.1, "filler_count": 0, "pause_ms": 700}
+            ],
+        },
+        headers=headers,
+    )
+    assert second.status_code == 200
+
+    overview = client.get("/dashboard/overview", headers=headers)
+    assert overview.status_code == 200
+    assert overview.json()["total_sessions"] >= 2
+    assert overview.json()["recent_30d"]["avg_overall_score"] >= 0
+
+    trends = client.get("/dashboard/trends/avg_overall_score", headers=headers)
+    assert trends.status_code == 200
+    assert len(trends.json()) >= 1
+
+    sessions_response = client.get("/dashboard/sessions", headers=headers)
+    assert sessions_response.status_code == 200
+    assert any(item["session_id"] == second.json()["id"] for item in sessions_response.json())
+
+    heatmap = client.get("/dashboard/heatmap", headers=headers)
+    assert heatmap.status_code == 200
+    assert heatmap.json()[-1]["count"] >= 1
+
+    fillers = client.get("/dashboard/fillers", headers=headers)
+    assert fillers.status_code == 200
+    assert fillers.json()["um"] >= 1
+
+    compare = client.get(
+        f"/dashboard/compare?session_a={first.json()['id']}&session_b={second.json()['id']}",
+        headers=headers,
+    )
+    assert compare.status_code == 200
+    assert "overall_score" in compare.json()["comparison"]
+
+
+def test_dashboard_is_user_scoped():
+    headers = get_admin_headers()
+    signup = client.post("/auth/signup", json={"email": "scoped@example.com", "password": "secret123"})
+    assert signup.status_code == 200
+    other_headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
+
+    response = client.post(
+        "/sessions",
+        json={
+            "title": "Private",
+            "mode": "Practice",
+            "duration_ms": 1000,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 1000, "text": "Private session"}],
+            "metrics": [],
+        },
+        headers=headers,
+    )
+    assert response.status_code == 200
+
+    other_sessions = client.get("/dashboard/sessions", headers=other_headers)
+    assert other_sessions.status_code == 200
+    assert all(item["session_id"] != response.json()["id"] for item in other_sessions.json())
+
+
+def test_goal_crud_progress_and_user_scoping():
+    headers = get_admin_headers()
+    session_response = client.post(
+        "/sessions",
+        json={
+            "title": "Goal baseline",
+            "mode": "Practice",
+            "duration_ms": 60000,
+            "wpm_avg": 130,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 60000, "text": "A focused baseline session"}],
+            "metrics": [],
+        },
+        headers=headers,
+    )
+    assert session_response.status_code == 200
+    assert client.get("/dashboard/overview", headers=headers).status_code == 200
+    create_response = client.post(
+        "/dashboard/goals",
+        json={
+            "metric_name": "wpm",
+            "comparison": "between",
+            "target_value": 100,
+            "target_upper": 160,
+            "is_active": True,
+        },
+        headers=headers,
+    )
+    assert create_response.status_code == 201
+    goal = create_response.json()
+    assert goal["metric_name"] == "wpm"
+    assert goal["current_value"] is not None
+    assert goal["achieved"] is True
+
+    duplicate = client.post(
+        "/dashboard/goals",
+        json={"metric_name": "wpm", "comparison": "gte", "target_value": 120},
+        headers=headers,
+    )
+    assert duplicate.status_code == 409
+
+    invalid_range = client.post(
+        "/dashboard/goals",
+        json={
+            "metric_name": "overall_score",
+            "comparison": "between",
+            "target_value": 80,
+            "target_upper": 70,
+        },
+        headers=headers,
+    )
+    assert invalid_range.status_code == 422
+
+    update_response = client.patch(
+        f"/dashboard/goals/{goal['id']}",
+        json={"comparison": "gte", "target_value": 200, "is_active": False},
+        headers=headers,
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["target_upper"] is None
+    assert update_response.json()["achieved"] is False
+    assert update_response.json()["is_active"] is False
+
+    signup = client.post("/auth/signup", json={"email": "goal-scoped@example.com", "password": "secret123"})
+    assert signup.status_code == 200
+    other_headers = {"Authorization": f"Bearer {signup.json()['access_token']}"}
+    assert client.patch(f"/dashboard/goals/{goal['id']}", json={"is_active": True}, headers=other_headers).status_code == 404
+    assert client.delete(f"/dashboard/goals/{goal['id']}", headers=other_headers).status_code == 404
+    assert client.get("/dashboard/goals", headers=other_headers).json() == []
+
+    delete_response = client.delete(f"/dashboard/goals/{goal['id']}", headers=headers)
+    assert delete_response.status_code == 200
+    assert delete_response.json()["status"] == "deleted"
+
+
+def test_coaching_prompt_truncation_and_json_parsing():
+    long_transcript = "word " * 5000
+    prompt = build_coaching_prompt(
+        long_transcript,
+        {"wpm": 120, "overall_score": 70, "filler_breakdown": {"um": 2}},
+        [],
+        active_goals=[
+            {
+                "metric_name": "filler_rate",
+                "comparison": "lte",
+                "target_value": 1,
+                "current_value": 2,
+                "achieved": False,
+            }
+        ],
+    )
+    assert "filler_rate: target lte 1" in prompt
+    assert "[transcript truncated]" in prompt
+
+    parsed = parse_coaching_response(
+        json.dumps(
+            {
+                "summary": "Good session.",
+                "strengths": [{"area": "pace", "detail": "Steady"}],
+                "improvements": [{"area": "fillers", "detail": "Pause more", "priority": "medium"}],
+                "drills": [{"name": "Pause drill", "description": "Pause", "duration_minutes": 5}],
+                "practice_plan": {"focus_areas": ["fillers"], "next_session_goal": "Use fewer fillers"},
+            }
+        )
+    )
+    assert parsed["summary"] == "Good session."
+
+
+def test_coaching_worker_success_and_failure(monkeypatch):
+    headers = get_admin_headers()
+    response = client.post(
+        "/sessions",
+        json={
+            "title": "Coach Me",
+            "mode": "Practice",
+            "duration_ms": 60000,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 60000, "text": "Hello coach"}],
+            "metrics": [],
+        },
+        headers=headers,
+    )
+    session_id = response.json()["id"]
+
+    def fake_generate(transcript, metrics, history, previous_feedback=None, active_goals=None):
+        return {
+            "summary": "Local feedback ready.",
+            "strengths": [{"area": "clarity", "detail": "Clear opening"}],
+            "improvements": [{"area": "pace", "detail": "Keep it steady", "priority": "low"}],
+            "drills": [{"name": "Pace drill", "description": "Read for one minute"}],
+            "practice_plan": {"focus_areas": ["pace"], "next_session_goal": "Stay near 140 WPM"},
+            "raw_response": "{}",
+            "model_used": "llama3.2:3b",
+            "generation_time_ms": 10,
+        }
+
+    monkeypatch.setattr(worker_jobs, "generate_coaching_feedback", fake_generate)
+    result = asyncio.run(worker_jobs.generate_session_coaching({}, session_id, 1))
+    assert result["status"] == "completed"
+
+    coaching_response = client.get(f"/coaching/session/{session_id}", headers=headers)
+    assert coaching_response.status_code == 200
+    assert coaching_response.json()["summary"] == "Local feedback ready."
+
+    def fake_failure(transcript, metrics, history, previous_feedback=None, active_goals=None):
+        raise RuntimeError("Ollama unavailable")
+
+    monkeypatch.setattr(worker_jobs, "generate_coaching_feedback", fake_failure)
+    failed = asyncio.run(worker_jobs.generate_session_coaching({}, session_id, 1))
+    assert failed["status"] == "failed"
+    failed_response = client.get(f"/coaching/session/{session_id}", headers=headers)
+    assert failed_response.json()["status"] == "failed"
+    assert "Ollama unavailable" in failed_response.json()["error_message"]
+
+
+def test_coaching_retry_endpoint_queues_job(monkeypatch):
+    headers = get_admin_headers()
+    response = client.post(
+        "/sessions",
+        json={
+            "title": "Retry Coach",
+            "mode": "Practice",
+            "duration_ms": 1000,
+            "transcript_segments": [{"start_ms": 0, "end_ms": 1000, "text": "Retry coaching"}],
+            "metrics": [],
+        },
+        headers=headers,
+    )
+    session_id = response.json()["id"]
+
+    async def fake_enqueue(session_id_arg, user_id_arg):
+        assert session_id_arg == session_id
+        assert user_id_arg == 1
+        return "job-coaching-1"
+
+    monkeypatch.setattr(coaching_routes, "enqueue_coaching", fake_enqueue)
+    retry = client.post(f"/coaching/session/{session_id}/retry", headers=headers)
+    assert retry.status_code == 200
+    assert retry.json() == {"status": "queued", "job_id": "job-coaching-1"}
 
 
 def test_schema_upgrade_adds_document_columns(tmp_path, monkeypatch):

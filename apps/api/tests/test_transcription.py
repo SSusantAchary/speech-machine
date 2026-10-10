@@ -4,13 +4,15 @@ import sys
 import types
 from uuid import uuid4
 
-os.environ["DATABASE_URL"] = f"sqlite:///./test_{uuid4().hex}.db"
+test_id = uuid4().hex
+os.environ["DATABASE_URL"] = f"sqlite:///./test_{test_id}.db"
 os.environ["LOCAL_ONLY_MODE"] = "true"
+os.environ["STORAGE_DIR"] = f"/private/tmp/speech_machine_test_{test_id}"
 
 from fastapi.testclient import TestClient
 
 from app.main import app
-from app.db import SessionLocal
+from app.db import Base, SessionLocal, engine
 from app import models
 from app import transcription
 from app import hf_models
@@ -18,6 +20,25 @@ from app.routes import sessions as session_routes
 from app.storage import storage_client
 
 client = TestClient(app)
+Base.metadata.create_all(bind=engine)
+_admin_headers: dict[str, str] | None = None
+
+
+def get_admin_headers() -> dict[str, str]:
+    global _admin_headers
+    if _admin_headers is not None:
+        return _admin_headers
+    status_response = client.get("/setup/status")
+    if status_response.json()["setup_required"]:
+        setup_response = client.post(
+            "/setup",
+            json={"email": "admin@example.com", "password": "secret123"},
+        )
+        assert setup_response.status_code == 201
+    response = client.post("/auth/login", json={"email": "admin@example.com", "password": "secret123"})
+    assert response.status_code == 200
+    _admin_headers = {"Authorization": f"Bearer {response.json()['access_token']}"}
+    return _admin_headers
 
 
 def create_transcription_model(model_id: str, name: str, available: bool = True, local_path: str | None = None):
@@ -33,9 +54,7 @@ def create_transcription_model(model_id: str, name: str, available: bool = True,
 
 
 def test_transcription_endpoint(monkeypatch, tmp_path: Path):
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Transcript",
@@ -92,6 +111,14 @@ def test_transcription_endpoint(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(transcription, "transcribe_audio", fake_transcribe_audio)
     monkeypatch.setattr(storage_client, "get_local_path", lambda path: str(video_path))
 
+    async def fake_enqueue(session_id_arg, user_id_arg, model_name, backend_id):
+        assert session_id_arg == session_id
+        assert model_name == "mlx-community/parakeet-tdt-0.6b-v3"
+        assert backend_id == "mlx_audio"
+        return "job-test"
+
+    monkeypatch.setattr(session_routes, "enqueue_transcription", fake_enqueue)
+
     response = client.post(
         f"/sessions/{session_id}/transcribe",
         json={
@@ -101,10 +128,11 @@ def test_transcription_endpoint(monkeypatch, tmp_path: Path):
         headers=headers,
     )
     assert response.status_code == 200
+    assert response.json()["job_id"] == "job-test"
 
     # Run background task synchronously
     db = SessionLocal()
-    user = db.query(models.User).filter(models.User.email == "admin").first()
+    user = db.query(models.User).filter(models.User.email == "admin@example.com").first()
     user_id = user.id if user else 1
     db.close()
     session_routes._run_transcription(
@@ -124,9 +152,7 @@ def test_transcription_endpoint(monkeypatch, tmp_path: Path):
 
 
 def test_transcription_endpoint_rejects_unsupported_mlx_audio(monkeypatch, tmp_path: Path):
-    response = client.post("/auth/login", json={"email": "admin", "password": "admin"})
-    token = response.json()["access_token"]
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = get_admin_headers()
 
     payload = {
         "title": "Transcript Failure",
@@ -357,7 +383,7 @@ def test_download_server_model_uses_app_managed_storage(monkeypatch, tmp_path: P
         download_call["output_dir"] = output_dir
 
     monkeypatch.setattr(hf_models, "get_models_root", lambda: models_root)
-    fake_utils_module = types.SimpleNamespace(download_model=fake_download_model)
+    fake_utils_module = types.SimpleNamespace(download_model=fake_download_model, _MODELS={"small": object()})
     monkeypatch.setitem(
         sys.modules,
         "faster_whisper",

@@ -22,7 +22,7 @@ Below is a sample Speech-Machine screen showing the product layout and session s
 - Supports a scrollable reading document panel during recording for `.pdf` and `.txt` files.
 - Highlights the current reading block during recording using live browser speech cues when supported.
 - Exports complete session bundles and supports video-only delete or full session delete.
-- Supports local-only admin login or normal email/password authentication.
+- Supports first-run local admin setup and email/password authentication.
 
 ## Core Capabilities
 
@@ -195,7 +195,7 @@ Practical guidance:
 
 ```bash
 cp .env.example .env
-docker compose up --build
+make local-up
 ```
 
 Open:
@@ -203,10 +203,23 @@ Open:
 - App: `http://localhost:3000`
 - API docs: `http://localhost:8000/docs`
 
-Default local credentials:
+On first launch, open the app and create the local admin account in the setup screen.
 
-- username: `admin`
-- password: `admin`
+You can also create the first local admin from the terminal:
+
+```bash
+curl -X POST http://localhost:8000/setup \
+  -H "Content-Type: application/json" \
+  -d '{"email":"admin@example.com","password":"change-me-strong"}'
+```
+
+Then run a local smoke check:
+
+```bash
+make local-smoke
+```
+
+See [docs/local-machine.md](./docs/local-machine.md) for the full local workflow.
 
 ### Local development without Docker
 
@@ -231,13 +244,11 @@ npm run dev
 ## Build and Test
 
 ```bash
-docker compose build
+make local-build
 ```
 
 ```bash
-cd apps/web && npm test -- --run
-cd apps/web && npm run build
-cd apps/api && pytest
+make check
 ```
 
 ## Lines of Code
@@ -264,13 +275,14 @@ Source snapshot as of March 22, 2026, excluding `node_modules`, `.next`, caches,
 - Reading-document upload and guided reading panel
 - Draft recovery
 - Model download-on-demand from the UI
+- User-defined practice goals with live progress and goal-aware AI coaching
 - Docker-first local deployment
 
 ## Planned / Upcoming Upgrades
 
 - Better progress reporting for long model downloads
 - Broader browser support around live speech cues
-- Background job queue for heavier transcription workloads
+- Stronger progress reporting for queued transcription workloads
 - More production deployment presets
 - Native desktop shell packaging
 - Stronger benchmarking and latency reporting

@@ -9,6 +9,24 @@ services:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U video -d video"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   api:
     build:
@@ -17,9 +35,16 @@ services:
       DATABASE_URL: postgresql+psycopg2://video:video@db:5432/video
       JWT_SECRET: ${JWT_SECRET:-change-me}
       JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
-      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-1440}
+      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-15}
+      REFRESH_TOKEN_EXPIRE_DAYS: ${REFRESH_TOKEN_EXPIRE_DAYS:-7}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       LOCAL_ONLY_MODE: ${LOCAL_ONLY_MODE:-true}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
       STORAGE_DIR: /data/storage
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-500}
       S3_ENDPOINT: ${S3_ENDPOINT:-}
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-}
@@ -27,13 +52,70 @@ services:
       S3_REGION: ${S3_REGION:-}
       WHISPER_MODEL: ${WHISPER_MODEL:-small}
       WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      LLAMA_CPP_BASE_URL: ${LLAMA_CPP_BASE_URL:-http://host.docker.internal:8080}
+      COACHING_ENABLED: ${COACHING_ENABLED:-true}
+      COACHING_PROVIDER: ${COACHING_PROVIDER:-ollama}
+      COACHING_MODEL: ${COACHING_MODEL:-llama3.2:3b}
+      COACHING_TIMEOUT_SECONDS: ${COACHING_TIMEOUT_SECONDS:-90}
+      COACHING_MAX_TRANSCRIPT_CHARS: ${COACHING_MAX_TRANSCRIPT_CHARS:-8000}
+      RUN_MIGRATIONS: "true"
     volumes:
       - api_storage:/data/storage
       - api_models:/data/models
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2).read()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
     depends_on:
-      - db
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ./apps/api
+    command: arq app.worker.settings.WorkerSettings
+    environment:
+      DATABASE_URL: postgresql+psycopg2://video:video@db:5432/video
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      JWT_ALGORITHM: ${JWT_ALGORITHM:-HS256}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+      STORAGE_DIR: /data/storage
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      S3_ENDPOINT: ${S3_ENDPOINT:-}
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_DEVICE: ${WHISPER_DEVICE:-cpu}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      LMSTUDIO_BASE_URL: ${LMSTUDIO_BASE_URL:-http://host.docker.internal:1234/v1}
+      LLAMA_CPP_BASE_URL: ${LLAMA_CPP_BASE_URL:-http://host.docker.internal:8080}
+      COACHING_ENABLED: ${COACHING_ENABLED:-true}
+      COACHING_PROVIDER: ${COACHING_PROVIDER:-ollama}
+      COACHING_MODEL: ${COACHING_MODEL:-llama3.2:3b}
+      COACHING_TIMEOUT_SECONDS: ${COACHING_TIMEOUT_SECONDS:-90}
+      COACHING_MAX_TRANSCRIPT_CHARS: ${COACHING_MAX_TRANSCRIPT_CHARS:-8000}
+      RUN_MIGRATIONS: "false"
+    volumes:
+      - api_storage:/data/storage
+      - api_models:/data/models
+    depends_on:
+      api:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   web:
     build:
@@ -49,5 +131,6 @@ services:
 
 volumes:
   db_data:
+  redis_data:
   api_storage:
   api_models:

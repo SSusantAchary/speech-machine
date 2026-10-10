@@ -10,7 +10,7 @@ from app.config import settings
 
 class StorageClient:
     def __init__(self) -> None:
-        self.use_s3 = all(
+        self.use_s3 = settings.storage_backend == "s3" or all(
             [
                 settings.s3_endpoint,
                 settings.s3_access_key,
@@ -19,6 +19,18 @@ class StorageClient:
             ]
         )
         if self.use_s3:
+            missing = [
+                name
+                for name, value in {
+                    "S3_ENDPOINT": settings.s3_endpoint,
+                    "S3_ACCESS_KEY": settings.s3_access_key,
+                    "S3_SECRET_KEY": settings.s3_secret_key,
+                    "S3_BUCKET": settings.s3_bucket,
+                }.items()
+                if not value
+            ]
+            if missing:
+                raise RuntimeError(f"S3 storage is enabled but missing: {', '.join(missing)}")
             self.s3 = boto3.client(
                 "s3",
                 endpoint_url=settings.s3_endpoint,

@@ -21,12 +21,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
-import { apiFetch, getToken } from "@/lib/api";
+import { apiFetch, ensureAccessToken } from "@/lib/api";
 import { DocumentReaderPanel } from "@/components/document-reader-panel";
 import { splitTextByFillers } from "@/lib/fillers";
 import { useRequireAuth } from "@/lib/hooks/useRequireAuth";
 import { Select } from "@/components/ui/select";
 import { deleteSession } from "@/lib/session";
+import { SessionCoachingPanel } from "@/components/dashboard/session-coaching-panel";
 
 type TranscriptSegment = {
   id: number;
@@ -153,7 +154,7 @@ export default function SessionPage() {
 
   const downloadAsset = useCallback(
     async (path: string, fallbackName: string, format: string) => {
-      const token = getToken();
+      const token = await ensureAccessToken();
       if (!token) {
         setDownloadError("Sign in again to download the transcript.");
         return;
@@ -246,11 +247,6 @@ export default function SessionPage() {
 
   useEffect(() => {
     if (!sessionId || !session) return;
-    const token = getToken();
-    if (!token) {
-      setVideoError("Missing auth token. Sign in again.");
-      return;
-    }
     if (!session.video_path) {
       clearVideoUrl();
       setVideoError(null);
@@ -260,6 +256,10 @@ export default function SessionPage() {
     const loadVideo = async () => {
       try {
         setVideoError(null);
+        const token = await ensureAccessToken();
+        if (!token) {
+          throw new Error("Missing auth token. Sign in again.");
+        }
         const response = await fetch(`${apiUrl}/sessions/${sessionId}/video`, {
           headers: { Authorization: `Bearer ${token}` },
           signal: controller.signal,
@@ -281,7 +281,7 @@ export default function SessionPage() {
     };
     loadVideo();
     return () => controller.abort();
-  }, [apiUrl, clearVideoUrl, session?.video_path, sessionId]);
+  }, [apiUrl, clearVideoUrl, session, sessionId]);
 
   useEffect(
     () => () => {
@@ -514,6 +514,8 @@ export default function SessionPage() {
             </CardContent>
           </Card>
         </div>
+
+        <SessionCoachingPanel sessionId={Number(sessionId)} />
 
         <div className="grid gap-6 lg:grid-cols-[1.4fr_1fr]">
           <Card className="bg-white/80">

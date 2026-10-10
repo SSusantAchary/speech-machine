@@ -1,5 +1,7 @@
 from datetime import datetime
-from pydantic import BaseModel, EmailStr, Field
+from typing import Literal
+
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 class UserCreate(BaseModel):
@@ -15,6 +17,7 @@ class UserLogin(BaseModel):
 class UserOut(BaseModel):
     id: int
     email: EmailStr
+    is_admin: bool = False
 
     class Config:
         from_attributes = True
@@ -23,6 +26,61 @@ class UserOut(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str = "bearer"
+    expires_in: int | None = None
+    user: UserOut | None = None
+
+
+class SetupStatus(BaseModel):
+    setup_required: bool
+
+
+GoalMetric = Literal[
+    "wpm",
+    "filler_rate",
+    "overall_score",
+    "practice_days_per_week",
+    "session_duration_minutes",
+    "eye_contact_score",
+    "delivery_score",
+]
+GoalComparison = Literal["gte", "lte", "between"]
+
+
+class UserGoalCreate(BaseModel):
+    metric_name: GoalMetric
+    comparison: GoalComparison
+    target_value: float = Field(ge=0)
+    target_upper: float | None = Field(default=None, ge=0)
+    is_active: bool = True
+
+    @model_validator(mode="after")
+    def validate_range(self):
+        if self.comparison == "between":
+            if self.target_upper is None or self.target_upper <= self.target_value:
+                raise ValueError("between goals require target_upper greater than target_value")
+        elif self.target_upper is not None:
+            raise ValueError("target_upper is only valid for between goals")
+        return self
+
+
+class UserGoalUpdate(BaseModel):
+    comparison: GoalComparison | None = None
+    target_value: float | None = Field(default=None, ge=0)
+    target_upper: float | None = Field(default=None, ge=0)
+    is_active: bool | None = None
+
+
+class UserGoalOut(BaseModel):
+    id: int
+    metric_name: GoalMetric
+    comparison: GoalComparison
+    target_value: float
+    target_upper: float | None
+    is_active: bool
+    current_value: float | None
+    achieved: bool
+    created_at: datetime
+    updated_at: datetime
 
 
 class TranscriptionRequest(BaseModel):

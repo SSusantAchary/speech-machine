@@ -4,15 +4,38 @@ type JwtPayload = {
   exp?: number;
 };
 
+type TokenResponse = {
+  access_token: string;
+  token_type: string;
+  expires_in?: number;
+  user?: {
+    id: number;
+    email: string;
+    is_admin: boolean;
+  };
+};
+
+let accessToken: string | null = null;
+let refreshPromise: Promise<string> | null = null;
+
 const decodeBase64Url = (value: string) => {
   const normalized = value.replace(/-/g, "+").replace(/_/g, "/");
   const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
-  if (typeof window === "undefined") return null;
   try {
-    return window.atob(padded);
+    if (typeof window !== "undefined") {
+      return window.atob(padded);
+    }
+    return Buffer.from(padded, "base64").toString("utf8");
   } catch {
     return null;
   }
+};
+
+const apiUrl = (path: string) => (path.startsWith("http") ? path : `${baseUrl}${path}`);
+
+const isAuthPath = (path: string) => {
+  const resolved = path.startsWith("http") ? new URL(path).pathname : path;
+  return resolved.startsWith("/auth/") || resolved.startsWith("/setup");
 };
 
 export const getTokenPayload = (token: string): JwtPayload | null => {
@@ -27,71 +50,124 @@ export const getTokenPayload = (token: string): JwtPayload | null => {
   }
 };
 
-export const getToken = () => {
-  if (typeof window === "undefined") return null;
-  return window.localStorage.getItem("auth_token");
-};
+export const getToken = () => accessToken;
 
 export const hasValidToken = () => {
-  const token = getToken();
-  if (!token) return false;
-  const payload = getTokenPayload(token);
-  if (!payload) return false;
-  if (!payload.exp) return false;
-  return payload.exp * 1000 > Date.now();
+  if (!accessToken) return false;
+  const payload = getTokenPayload(accessToken);
+  if (!payload?.exp) return false;
+  return payload.exp * 1000 > Date.now() + 5000;
 };
 
-export const setToken = (token: string) => {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem("auth_token", token);
+export const setToken = (token: string | null) => {
+  accessToken = token;
 };
 
 export const clearToken = () => {
-  if (typeof window === "undefined") return;
-  window.localStorage.removeItem("auth_token");
+  accessToken = null;
 };
 
-export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+const parseError = async (response: Response) => {
+  const message = await response.text();
+  try {
+    const parsed = JSON.parse(message) as { detail?: string };
+    return parsed.detail || message;
+  } catch {
+    return message;
+  }
+};
+
+const refreshAccessToken = async () => {
+  const response = await fetch(apiUrl("/auth/refresh"), {
+    method: "POST",
+    credentials: "include",
+  });
+  if (!response.ok) {
+    clearToken();
+    throw new Error("Session expired. Sign in again.");
+  }
+  const data = (await response.json()) as TokenResponse;
+  setToken(data.access_token);
+  return data.access_token;
+};
+
+const getFreshAccessToken = () => {
+  if (!refreshPromise) {
+    refreshPromise = refreshAccessToken().finally(() => {
+      refreshPromise = null;
+    });
+  }
+  return refreshPromise;
+};
+
+export const ensureAccessToken = async () => {
+  if (hasValidToken()) return accessToken;
+  try {
+    return await getFreshAccessToken();
+  } catch {
+    return null;
+  }
+};
+
+const fetchWithAuth = async (path: string, options: RequestInit = {}) => {
   const headers = new Headers(options.headers || {});
-  const token = getToken();
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  if (accessToken) {
+    headers.set("Authorization", `Bearer ${accessToken}`);
   }
   if (!(options.body instanceof FormData) && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
-  const response = await fetch(`${baseUrl}${path}`, {
+  return fetch(apiUrl(path), {
     ...options,
     headers,
+    credentials: "include",
   });
-  if (!response.ok) {
-    const message = await response.text();
-    let detail = message;
+};
+
+export async function apiFetch<T>(path: string, options: RequestInit = {}): Promise<T> {
+  let response = await fetchWithAuth(path, options);
+  if (response.status === 401 && !isAuthPath(path)) {
     try {
-      const parsed = JSON.parse(message) as { detail?: string };
-      detail = parsed.detail || message;
+      await getFreshAccessToken();
+      response = await fetchWithAuth(path, options);
     } catch {
-      detail = message;
+      clearToken();
+      throw new Error("Authentication expired. Sign in again.");
     }
+  }
+
+  if (!response.ok) {
     if (response.status === 401) {
       clearToken();
       throw new Error("Authentication expired. Sign in again.");
     }
-    throw new Error(detail || "Request failed");
+    throw new Error((await parseError(response)) || "Request failed");
   }
-  return response.json();
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+  return response.json() as Promise<T>;
 }
 
 export const authApi = {
+  setupStatus: () => apiFetch<{ setup_required: boolean }>("/setup/status"),
+  setup: (email: string, password: string) =>
+    apiFetch<TokenResponse>("/setup", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }),
   signup: (email: string, password: string) =>
-    apiFetch<{ access_token: string }>("/auth/signup", {
+    apiFetch<TokenResponse>("/auth/signup", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     }),
   login: (email: string, password: string) =>
-    apiFetch<{ access_token: string }>("/auth/login", {
+    apiFetch<TokenResponse>("/auth/login", {
       method: "POST",
       body: JSON.stringify({ email, password }),
     }),
+  me: () => apiFetch<{ id: number; email: string; is_admin: boolean }>("/auth/me"),
+  refresh: () => apiFetch<TokenResponse>("/auth/refresh", { method: "POST" }),
   logout: () => apiFetch("/auth/logout", { method: "POST" }),
 };

@@ -8,7 +8,7 @@ import zipfile
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,9 @@ from app.auth import get_current_user
 from app.config import settings
 from app.db import SessionLocal, get_db
 from app.scoring import compute_score
+from app.services.analytics import compute_session_metrics
 from app.storage import storage_client
+from app.worker.enqueue import enqueue_transcription
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -28,12 +30,16 @@ def _resolve_video_format(value: Optional[str]) -> tuple[str, str]:
     if "video/" in lower:
         if "mp4" in lower:
             return "mp4", "video/mp4"
+        if "quicktime" in lower:
+            return "mp4", "video/quicktime"
         if "webm" in lower:
             return "webm", "video/webm"
         return "webm", "video/webm"
     suffix = Path(lower).suffix
     if suffix == ".mp4":
         return "mp4", "video/mp4"
+    if suffix == ".mov":
+        return "mp4", "video/quicktime"
     if suffix == ".webm":
         return "webm", "video/webm"
     return "webm", "video/webm"
@@ -50,6 +56,58 @@ def _detect_media_type(video_path: str, fallback: str) -> str:
     except OSError:
         return fallback
     return fallback
+
+
+def _file_size_and_header(file_obj, header_size: int = 16) -> tuple[int, bytes]:
+    current = file_obj.tell()
+    file_obj.seek(0, os.SEEK_END)
+    size = file_obj.tell()
+    file_obj.seek(0)
+    header = file_obj.read(header_size)
+    file_obj.seek(current)
+    return size, header
+
+
+def _validate_size(size: int, label: str) -> None:
+    if size > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=f"{label} exceeds the {settings.max_upload_mb} MB upload limit.",
+        )
+
+
+def _validate_video_header(header: bytes, media_type: str) -> None:
+    if media_type in {"video/mp4", "video/quicktime"}:
+        if len(header) >= 8 and header[4:8] == b"ftyp":
+            return
+    if media_type == "video/webm" and header.startswith(b"\x1a\x45\xdf\xa3"):
+        return
+    raise HTTPException(status_code=415, detail="Unsupported or invalid video file.")
+
+
+def _validate_video_upload(file: UploadFile, media_type: str) -> None:
+    size, header = _file_size_and_header(file.file)
+    _validate_size(size, "Video")
+    _validate_video_header(header, media_type)
+    file.file.seek(0)
+
+
+def _validate_video_path(path: Path, media_type: str) -> None:
+    size = path.stat().st_size
+    _validate_size(size, "Video")
+    with open(path, "rb") as merged:
+        header = merged.read(16)
+    _validate_video_header(header, media_type)
+
+
+def _validate_document_upload(file: UploadFile, extension: str, mime_type: str) -> None:
+    size, header = _file_size_and_header(file.file)
+    _validate_size(size, "Document")
+    if extension == ".pdf" and not header.startswith(b"%PDF-"):
+        raise HTTPException(status_code=415, detail="Invalid PDF file.")
+    if mime_type == "text/plain" and b"\x00" in header:
+        raise HTTPException(status_code=415, detail="Invalid text file.")
+    file.file.seek(0)
 
 
 def _serialize_transcript_segments(
@@ -346,6 +404,8 @@ def create_session(
 
     db.commit()
     db.refresh(session)
+    compute_session_metrics(db, session.id)
+    db.refresh(session)
 
     return _session_to_out(session)
 
@@ -403,11 +463,14 @@ def upload_video(
     current_user: models.User = Depends(get_current_user),
 ):
     session = _get_session_or_404(db, current_user.id, session_id)
-    extension, _resolved_mime = _resolve_video_format(mime_type or file.content_type)
+    extension, resolved_mime = _resolve_video_format(mime_type or file.content_type or file.filename)
 
     if chunk_index is not None and total_chunks is not None:
         if not upload_id:
             raise HTTPException(status_code=400, detail="upload_id required")
+        chunk_size, _header = _file_size_and_header(file.file)
+        _validate_size(chunk_size, "Video chunk")
+        file.file.seek(0)
         tmp_dir = Path(settings.storage_dir) / "tmp" / upload_id
         tmp_dir.mkdir(parents=True, exist_ok=True)
         chunk_path = tmp_dir / f"{chunk_index}.part"
@@ -423,6 +486,7 @@ def upload_video(
                         raise HTTPException(status_code=400, detail="missing chunk")
                     with open(part_path, "rb") as part:
                         shutil.copyfileobj(part, merged)
+            _validate_video_path(merged_path, resolved_mime)
             key = f"sessions/{session_id}/recording.{extension}"
             with open(merged_path, "rb") as merged_file:
                 stored_path = storage_client.save_file(key, merged_file)
@@ -433,6 +497,7 @@ def upload_video(
 
         return {"session_id": session_id, "status": "partial"}
 
+    _validate_video_upload(file, resolved_mime)
     key = f"sessions/{session_id}/recording.{extension}"
     stored_path = storage_client.save_file(key, file.file)
     session.video_path = stored_path
@@ -450,6 +515,7 @@ def upload_document(
 ):
     session = _get_session_or_404(db, current_user.id, session_id)
     extension, mime_type = _resolve_document_format(file.filename, file.content_type)
+    _validate_document_upload(file, extension, mime_type)
     normalized_blocks_json = _normalize_document_blocks_payload(blocks_json)
 
     if session.document_path:
@@ -471,9 +537,8 @@ def upload_document(
 
 
 @router.post("/{session_id}/transcribe")
-def transcribe_session(
+async def transcribe_session(
     session_id: int,
-    background_tasks: BackgroundTasks,
     payload: schemas.TranscriptionRequest | None = None,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
@@ -496,8 +561,13 @@ def transcribe_session(
     session.transcription_status = "queued"
     db.commit()
 
-    background_tasks.add_task(_run_transcription, session_id, current_user.id, selected_model, selected_backend)
-    return {"status": "queued"}
+    try:
+        job_id = await enqueue_transcription(session_id, current_user.id, selected_model, selected_backend)
+    except Exception as exc:
+        session.transcription_status = "idle"
+        db.commit()
+        raise HTTPException(status_code=503, detail="Job backend unavailable") from exc
+    return {"status": "queued", "job_id": job_id}
 
 
 @router.delete("/{session_id}")
@@ -660,6 +730,7 @@ def _run_transcription(
 ) -> None:
     db = SessionLocal()
     session: models.Session | None = None
+    audio_path: str | None = None
     try:
         session = (
             db.query(models.Session)
@@ -711,6 +782,7 @@ def _run_transcription(
             db.add(models.Score(session_id=session.id, data=score_payload))
         session.transcription_status = "complete"
         db.commit()
+        compute_session_metrics(db, session.id)
     except Exception:
         if session is None and session_id:
             session = db.query(models.Session).filter(models.Session.id == session_id).first()
@@ -721,6 +793,15 @@ def _run_transcription(
                 session.transcription_status = _status_for_missing_video(session)
             db.commit()
     finally:
+        if audio_path:
+            try:
+                audio_file = Path(audio_path)
+                if audio_file.exists():
+                    audio_file.unlink()
+                if audio_file.parent.exists():
+                    audio_file.parent.rmdir()
+            except OSError:
+                pass
         db.close()
 
 

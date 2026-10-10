@@ -22,6 +22,11 @@ export type TranscriptionSelection = {
   model?: string;
 };
 
+export type TranscriptionJobResponse = {
+  status: string;
+  job_id?: string;
+};
+
 export type SessionDocumentPayload = {
   file: Blob;
   name: string;
@@ -162,7 +167,7 @@ export const uploadVideoFile = async (sessionId: number, file: File, chunkSize =
 };
 
 export const triggerTranscription = (sessionId: number, selection?: TranscriptionSelection) =>
-  apiFetch(`/sessions/${sessionId}/transcribe`, {
+  apiFetch<TranscriptionJobResponse>(`/sessions/${sessionId}/transcribe`, {
     method: "POST",
     body: selection ? JSON.stringify(selection) : undefined,
   });
